@@ -2,39 +2,49 @@
 # -*- coding: utf-8 -*-
 
 """
-people_bio_streamlit (cloud-friendly)
+people_bio_streamlit.py — Streamlit UI for multi-keyword person search -> overlap links -> biography
 
-- No Selenium / no system browser required.
-- Uses duckduckgo_search for web results.
-- Fetches pages with requests + BeautifulSoup (best-effort).
-- Same Streamlit UX:
-  1) person + keywords → separate searches (person + kw)
-  2) detect overlapping links
-  3) show up to 3 profile candidates (image+name+LinkedIn when available)
-  4) build a biography (Gemini optional; local fallback included)
+Flow:
+1) User enters a Person name (e.g., "Elysia Chan") and a comma-separated list of keywords (e.g., "McKinsey, Insurance, Accenture").
+2) For each keyword, run a separate search ("person + keyword") on Bing (or Google) using Selenium.
+3) Aggregate results (per-query CSV + combined CSV); display results in the app.
+4) Identify overlapping links (appear in >1 query). Optionally verify via page titles/meta.
+5) Show up to 3 profile candidates (image + name + LinkedIn when available); user selects.
+6) Build a biography from verified/overlapping sources; Gemini if configured, else local fallback.
 
-If a site needs JS to render, we still try to pull title/og:meta/snippets;
-that’s usually enough for this workflow.
+Requirements:
+- Python 3.10+
+- selenium, streamlit, pandas, beautifulsoup4, nltk
+- (Optional) google-generativeai for Gemini
+- Edge or Chrome installed (Selenium Manager fetches drivers automatically)
 """
 
 import os
 import re
-import json
 import time
+import json
+import hashlib
 from pathlib import Path
-from urllib.parse import urlparse
-from collections import Counter
+from urllib.parse import urlparse, quote_plus
 
-import requests
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# Search backend (no browser):
-from duckduckgo_search import DDGS
+# Selenium
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    TimeoutException,
+    WebDriverException,
+    NoSuchElementException,
+)
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# NLTK
+# NLTK (with safe ensure)
 import nltk
+from collections import Counter
 
 # Gemini (optional)
 try:
@@ -49,6 +59,7 @@ except Exception:
 # ---------------------------
 
 def ensure_nltk():
+    """Ensure NLTK resources; handle punkt_tab if present in newer NLTK."""
     needed = ["punkt", "stopwords"]
     try:
         import nltk.tokenize.punkt  # noqa
@@ -76,145 +87,202 @@ def safe_filename(text: str, max_len: int = 60) -> str:
     return text[:max_len] if len(text) > max_len else text
 
 
+def make_driver(browser: str = "edge", headless: bool = True):
+    """
+    Create a Selenium WebDriver using Selenium Manager (no manual driver downloads).
+    Supports 'edge' or 'chrome'.
+    """
+    browser = browser.lower().strip()
+    if browser not in {"edge", "chrome"}:
+        raise ValueError("browser must be 'edge' or 'chrome'")
+
+    if browser == "edge":
+        options = webdriver.EdgeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--start-maximized")
+        return webdriver.Edge(options=options)
+    else:
+        options = webdriver.ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--start-maximized")
+        return webdriver.Chrome(options=options)
+
+
+def parse_bing_results(driver):
+    """Return list of {title, link, snippet} for current Bing SERP."""
+    WebDriverWait(driver, 12).until(EC.presence_of_element_located((By.ID, "b_results")))
+    time.sleep(0.8)
+    results = []
+    cards = driver.find_elements(By.CSS_SELECTOR, "#b_results > li.b_algo, #b_results li[data-bm]")
+    for item in cards:
+        try:
+            title, link, snippet = "", "", ""
+            try:
+                h2 = item.find_element(By.CSS_SELECTOR, "h2")
+                title = (h2.text or "").strip()
+                a = h2.find_element(By.CSS_SELECTOR, "a")
+                link = (a.get_attribute("href") or "").strip()
+            except NoSuchElementException:
+                a = item.find_element(By.CSS_SELECTOR, "a")
+                link = (a.get_attribute("href") or "").strip()
+                title = (a.text or "").strip()
+
+            snip_eles = item.find_elements(By.CSS_SELECTOR, ".b_caption p, .b_snippet, p, div.b_algoSlug")
+            if snip_eles:
+                snippet = (snip_eles[0].text or "").strip()
+
+            if link:
+                results.append({"title": title, "link": link, "snippet": snippet})
+        except Exception:
+            pass
+    return results
+
+
+def parse_google_results(driver):
+    """Return list of {title, link, snippet} for current Google SERP (best-effort)."""
+    WebDriverWait(driver, 12).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div#search")))
+    time.sleep(0.8)
+    results = []
+    blocks = driver.find_elements(By.CSS_SELECTOR, "div#search div.g, div#search div[data-header-feature]")
+    if not blocks:
+        blocks = driver.find_elements(By.CSS_SELECTOR, "div#search a h3")
+    for block in blocks:
+        try:
+            title, link, snippet = "", "", ""
+            try:
+                a = block.find_element(By.CSS_SELECTOR, "a")
+                link = (a.get_attribute("href") or "").strip()
+                h3 = block.find_element(By.CSS_SELECTOR, "h3")
+                title = (h3.text or "").strip()
+            except NoSuchElementException:
+                try:
+                    h3 = block.find_element(By.CSS_SELECTOR, "h3")
+                    title = (h3.text or "").strip()
+                    parent = h3.find_element(By.XPATH, "..")
+                    link = (parent.get_attribute("href") or "").strip()
+                except Exception:
+                    pass
+
+            for sel in ["div.VwiC3b", "span.aCOpRe", "div[data-sncf]"]:
+                try:
+                    s = block.find_element(By.CSS_SELECTOR, sel)
+                    snippet = s.text.strip()
+                    if snippet:
+                        break
+                except NoSuchElementException:
+                    continue
+
+            if link:
+                results.append({"title": title, "link": link, "snippet": snippet})
+        except Exception:
+            pass
+    return results
+
+
+def run_search(query: str, engine: str = "bing", browser: str = "edge", headless: bool = True):
+    """Run a single query on Bing or Google and return parsed results."""
+    driver = make_driver(browser=browser, headless=headless)
+    try:
+        encoded = quote_plus(query)
+        if engine == "google":
+            driver.get(f"https://www.google.com/search?q={encoded}")
+            results = parse_google_results(driver)
+        else:
+            driver.get(f"https://www.bing.com/search?q={encoded}")
+            results = parse_bing_results(driver)
+        return results
+    finally:
+        driver.quit()
+
+
 def normalize_link(u: str) -> str:
-    """Normalize URL for overlap grouping (scheme + netloc + stripped path)."""
+    """Normalize URL for overlap grouping (domain + path w/o fragments/query)."""
     try:
         p = urlparse(u)
-        path = re.sub(r"/+$", "", (p.path or "/"))
+        path = re.sub(r"/+$", "", p.path or "/")
         return f"{p.scheme}://{p.netloc}{path}".lower()
     except Exception:
-        return (u or "").lower().strip()
+        return u.lower().strip()
 
-
-# ---------------------------
-# Search (DuckDuckGo)
-# ---------------------------
-
-def run_search_ddg(query: str, max_results: int = 25) -> list[dict]:
-    """
-    Return list of dicts: {title, link, snippet}
-    Uses duckduckgo_search.web with safe params for server environments.
-    """
-    out = []
-    try:
-        with DDGS() as ddg:
-            for r in ddg.text(query, max_results=max_results, region="wt-wt"):  # global-ish
-                # r: {'title','href','body'} keys typically
-                title = (r.get("title") or "").strip()
-                link = (r.get("href") or "").strip()
-                snippet = (r.get("body") or "").strip()
-                if link:
-                    out.append({"title": title, "link": link, "snippet": snippet})
-    except Exception:
-        pass
-    return out
-
-
-# ---------------------------
-# Fetch & parse pages (requests)
-# ---------------------------
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-def fetch_html(url: str, timeout=15) -> str:
-    try:
-        r = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True)
-        if r.status_code == 200 and "text/html" in r.headers.get("Content-Type",""):
-            return r.text
-    except Exception:
-        pass
-    return ""
-
-
-def harvest_page_text(url: str, person: str = "") -> dict:
-    """
-    Best-effort HTML parse:
-    - title
-    - meta og:image
-    - meta description
-    - main text (main/article/p)
-    """
-    res = {"title": "", "text": "", "og_image": "", "meta_desc": "", "has_person_in_title": False}
-    html = fetch_html(url)
-    if not html:
-        return res
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Title
-    try:
-        res["title"] = (soup.title.string or "").strip()
-    except Exception:
-        res["title"] = ""
-
-    # og:image
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        res["og_image"] = og["content"]
-
-    # meta description
-    md = soup.find("meta", attrs={"name": "description"})
-    if md and md.get("content"):
-        res["meta_desc"] = md["content"]
-
-    # main text
-    for tag in soup(["script", "style", "noscript"]):
-        tag.extract()
-
-    main_candidates = soup.find_all(["main", "article"])
-    if main_candidates:
-        text = main_candidates[0].get_text(separator="\n", strip=True)
-    else:
-        ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-        text = "\n\n".join(ps)
-
-    text = re.sub(r"\n{3,}", "\n\n", (text or ""))
-    res["text"] = text[:200000]
-    if person and res["title"]:
-        res["has_person_in_title"] = bool(re.search(re.escape(person), res["title"], flags=re.I))
-    return res
-
-
-# ---------------------------
-# Overlap logic
-# ---------------------------
 
 def find_common_links(results_by_query: dict, min_appearances: int = 2):
+    """
+    results_by_query = { query: [ {title, link, snippet}, ... ], ... }
+    returns list of dicts: {normalized_link, appearances, samples}
+    """
     counter = {}
     samples = {}
     for q, rows in results_by_query.items():
-        seen = set()
+        seen_for_q = set()
         for r in rows:
             nl = normalize_link(r["link"])
-            if not nl or nl in seen:
+            if nl in seen_for_q:
                 continue
-            seen.add(nl)
+            seen_for_q.add(nl)
             counter[nl] = counter.get(nl, 0) + 1
             samples.setdefault(nl, []).append({"query": q, **r})
-    commons = []
+    common = []
     for nl, c in counter.items():
         if c >= min_appearances:
-            commons.append({
+            common.append({
                 "normalized_link": nl,
                 "appearances": c,
                 "samples": samples.get(nl, [])[:5]
             })
-    commons.sort(key=lambda x: x["appearances"], reverse=True)
-    return commons
+    common.sort(key=lambda x: x["appearances"], reverse=True)
+    return common
 
 
-# ---------------------------
-# Keywords
-# ---------------------------
+def harvest_page_text(url: str, browser: str = "edge", headless: bool = True, person: str = ""):
+    """Fetch page with Selenium, return dict: {title, text, og_image, meta_desc, has_person_in_title}"""
+    driver = make_driver(browser=browser, headless=headless)
+    out = {"title": "", "text": "", "og_image": "", "meta_desc": "", "has_person_in_title": False}
+    try:
+        driver.set_page_load_timeout(25)
+        driver.get(url)
+        time.sleep(1.2)
+        out["title"] = driver.title or ""
+        html = driver.page_source or ""
+
+        soup = BeautifulSoup(html, "html.parser")
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            out["og_image"] = og["content"]
+        md = soup.find("meta", attrs={"name": "description"})
+        if md and md.get("content"):
+            out["meta_desc"] = md["content"]
+
+        for s in soup(["script", "style", "noscript"]):
+            s.extract()
+        main_candidates = soup.find_all(["main", "article"])
+        if main_candidates:
+            text = main_candidates[0].get_text(separator="\n", strip=True)
+        else:
+            ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+            text = "\n\n".join(ps)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        out["text"] = text[:200000]
+        if person:
+            out["has_person_in_title"] = bool(re.search(re.escape(person), out["title"], flags=re.I))
+        return out
+    except Exception:
+        return out
+    finally:
+        driver.quit()
+
 
 def get_top_keywords_from_texts(texts: list[str], person: str = "", companies: list[str] = None, top_n: int = 12):
+    """Extract top keywords from texts; remove the person & company tokens."""
     ensure_nltk()
     from nltk.corpus import stopwords
     try:
@@ -227,7 +295,7 @@ def get_top_keywords_from_texts(texts: list[str], person: str = "", companies: l
         tokens = []
         common_stops = {"the", "and", "of", "to", "in", "for", "on", "with", "at", "by", "from"}
         for t in texts:
-            tokens.extend([w for w in re.findall(r"[A-Za-z0-9]+", (t or "").lower()) if w not in common_stops])
+            tokens.extend([w for w in re.findall(r"[A-Za-z0-9]+", t.lower()) if w not in common_stops])
 
     freq = Counter(tokens)
     if person:
@@ -237,12 +305,9 @@ def get_top_keywords_from_texts(texts: list[str], person: str = "", companies: l
         for c in companies:
             for part in c.split():
                 freq.pop(part.lower(), None)
+
     return [w for w, _ in freq.most_common(top_n)]
 
-
-# ---------------------------
-# Bio generation
-# ---------------------------
 
 def init_gemini(model_name: str = "gemini-2.5-flash", api_key: str | None = None):
     if not GEMINI_AVAILABLE:
@@ -255,6 +320,7 @@ def init_gemini(model_name: str = "gemini-2.5-flash", api_key: str | None = None
 
 
 def local_bio_from_chunks(person: str, company_hints: list[str], chunks: list[str]) -> str:
+    """Small offline heuristic writer when Gemini isn't available."""
     text = "\n\n".join(chunks)
     sentences = re.split(r"(?<=[.!?])\s+", text)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 30][:40]
@@ -263,6 +329,7 @@ def local_bio_from_chunks(person: str, company_hints: list[str], chunks: list[st
     edu = "Education details are not explicitly confirmed in the available sources."
     mentions = "Mentions and media references are drawn from overlapping links identified across searches."
     other = "Key strengths likely include domain knowledge, cross-functional collaboration, and an ability to operate across ambiguous contexts."
+
     return "\n".join([intro, edu, exp, mentions, other])
 
 
@@ -290,6 +357,11 @@ Text:
 
 
 def guess_profile_candidates(all_rows: list[dict], person: str):
+    """
+    Guess up to 3 profile candidates:
+    Prefer LinkedIn / people directories. Fetch og:image for card.
+    Returns: [{name, url, image, source_title}]
+    """
     pref = ["linkedin.com/in", "linkedin.com/pub", "crunchbase.com/person", "about", "team", "people"]
     ranked = []
     for r in all_rows:
@@ -315,7 +387,7 @@ def guess_profile_candidates(all_rows: list[dict], person: str):
         if base in seen:
             continue
         seen.add(base)
-        meta = harvest_page_text(url, person=person)
+        meta = harvest_page_text(url, headless=True, person=person)
         name_guess = r["title"] or meta["title"] or person
         out.append({
             "name": name_guess.strip()[:120],
@@ -333,9 +405,9 @@ def guess_profile_candidates(all_rows: list[dict], person: str):
 # ---------------------------
 
 st.set_page_config(page_title="Person Bio Finder", page_icon="🧭", layout="wide")
-st.title("🔎 Person Bio Finder (multi-keyword overlap) — Cloud Friendly")
+st.title("🔎 Person Bio Finder (multi-keyword overlap)")
 
-# Session state bootstrap
+# --- Session state initialization ---
 if "search_done" not in st.session_state:
     st.session_state.search_done = False
     st.session_state.results_by_query = {}
@@ -344,11 +416,18 @@ if "search_done" not in st.session_state:
     st.session_state.candidates = []
     st.session_state.person = ""
     st.session_state.keywords = []
+    st.session_state.engine = "bing"
+    st.session_state.browser = "edge"
+    st.session_state.headless = True
     st.session_state.outdir = "output"
     st.session_state.gemini_model = "gemini-2.5-flash"
     st.session_state.gemini_key = ""
 
 with st.sidebar:
+    st.markdown("### Search Settings")
+    engine = st.selectbox("Search engine", options=["bing", "google"], index=0)
+    browser = st.selectbox("Browser (Selenium)", options=["edge", "chrome"], index=0)
+    headless = st.checkbox("Headless", value=True)
     outdir = st.text_input("Output folder", value=st.session_state.outdir or "output")
     gemini_model = st.text_input("Gemini model (optional)", value=st.session_state.gemini_model or "gemini-2.5-flash")
     gemini_key = st.text_input("GEMINI_API_KEY (optional)", type="password", value=os.getenv("GEMINI_API_KEY", st.session_state.gemini_key))
@@ -358,10 +437,12 @@ with col1:
     person = st.text_input("Person name", value=st.session_state.person or "Elysia Chan")
     raw_keywords = st.text_input("Keywords (comma-separated)", value=", ".join(st.session_state.keywords) or "McKinsey, Insurance, Accenture")
 with col2:
-    st.markdown("**No browser needed.** We use a lightweight search and HTML fetching method suitable for cloud deployments.")
+    st.markdown("Enter a person and 2–6 keywords. We’ll search each combo separately, find overlapping links, "
+                "let you pick a likely profile, and then draft a bio from verifiable snippets.")
 
 go = st.button("Search")
 
+# --- SEARCH BUTTON HANDLER ---
 if go:
     os.makedirs(outdir, exist_ok=True)
     keywords = [k.strip() for k in raw_keywords.split(",") if k.strip()]
@@ -369,7 +450,7 @@ if go:
         st.error("Please enter a person and at least one keyword.")
         st.stop()
 
-    st.subheader("Step 1 — Run separate searches (duckduckgo)")
+    st.subheader("Step 1 — Run separate searches")
     results_by_query = {}
     all_rows = []
 
@@ -377,13 +458,14 @@ if go:
         prog = st.progress(0.0)
         for i, kw in enumerate(keywords, start=1):
             q = f"{person} {kw}"
-            st.write(f"• Searching: **{q}** …")
-            rows = run_search_ddg(q, max_results=25)
+            st.write(f"• Searching: **{q}** on {engine.title()} …")
+            rows = run_search(q, engine=engine, browser=browser, headless=headless)
             for r in rows:
                 r["query"] = q
             results_by_query[q] = rows
             all_rows.extend(rows)
 
+            # write per-query csv
             pd.DataFrame(rows).to_csv(Path(outdir) / f"{safe_filename(q)}.csv", index=False)
             prog.progress(i / max(1, len(keywords)))
 
@@ -426,6 +508,7 @@ if go:
         st.warning("Couldn’t auto-detect candidate profiles. You can still proceed.")
         candidates = []
 
+    # Render candidate cards on this run
     if candidates:
         cols = st.columns(len(candidates))
         for i, cand in enumerate(candidates):
@@ -433,12 +516,12 @@ if go:
                 if cand.get("image"):
                     st.image(cand["image"], use_container_width=True)
                 st.markdown(f"**{cand['name']}**")
-                if "linkedin.com" in (cand["url"] or "").lower():
+                if "linkedin.com" in cand["url"].lower():
                     st.markdown(f"[LinkedIn profile]({cand['url']})")
                 else:
                     st.markdown(f"[Open]({cand['url']})")
 
-    # Persist for Build Biography rerun
+    # Persist to session_state for the Build Biography button rerun
     st.session_state.search_done = True
     st.session_state.results_by_query = results_by_query
     st.session_state.all_rows = all_rows
@@ -446,11 +529,14 @@ if go:
     st.session_state.candidates = candidates
     st.session_state.person = person
     st.session_state.keywords = keywords
+    st.session_state.engine = engine
+    st.session_state.browser = browser
+    st.session_state.headless = headless
     st.session_state.outdir = outdir
     st.session_state.gemini_model = gemini_model
     st.session_state.gemini_key = gemini_key
 
-# Post-search UI
+# --- POST-SEARCH UI (survives reruns) ---
 if st.session_state.search_done:
     st.subheader("Step 3 — Pick a likely profile")
     candidates = st.session_state.candidates
@@ -462,7 +548,7 @@ if st.session_state.search_done:
                 if cand.get("image"):
                     st.image(cand["image"], use_container_width=True)
                 st.markdown(f"**{cand['name']}**")
-                if "linkedin.com" in (cand["url"] or "").lower():
+                if "linkedin.com" in cand["url"].lower():
                     st.markdown(f"[LinkedIn profile]({cand['url']})")
                 else:
                     st.markdown(f"[Open]({cand['url']})")
@@ -481,17 +567,21 @@ if st.session_state.search_done:
             keywords = st.session_state.keywords
             commons = st.session_state.commons
             all_rows = st.session_state.all_rows
+            browser = st.session_state.browser
+            headless = st.session_state.headless
             outdir = st.session_state.outdir
             gemini_model = st.session_state.gemini_model
             gemini_key = st.session_state.gemini_key
 
+            # company hints
             companies_hint = [kw for kw in keywords if re.search(r"(mckinsey|accenture|deloitte|kpmg|pwc|ey)", kw, flags=re.I)] or keywords[:2]
 
+            # harvest and verify
             harvest_chunks = []
             verified_cards = []
             for c in commons:
                 url = c["normalized_link"]
-                meta = harvest_page_text(url, person=person)
+                meta = harvest_page_text(url, browser=browser, headless=headless, person=person)
                 title = (meta["title"] or "").lower()
                 meta_desc = (meta["meta_desc"] or "").lower()
                 hint_hit = any(h.lower() in title or h.lower() in meta_desc for h in companies_hint)
@@ -500,7 +590,7 @@ if st.session_state.search_done:
                         f"URL: {url}",
                         f"TITLE: {meta['title']}",
                         f"DESC: {meta['meta_desc']}",
-                        (meta["text"] or "")[:3000]
+                        meta["text"][:3000]
                     ]))
                     verified_cards.append({"url": url, "title": meta["title"], "desc": meta["meta_desc"]})
 
@@ -520,10 +610,12 @@ if st.session_state.search_done:
 
             st.text_area("Biography", value=bio, height=260)
 
+            # Save outputs
             base = Path(outdir) / "bio_outputs"
             base.mkdir(parents=True, exist_ok=True)
             (base / f"{safe_filename(person)}_bio.txt").write_text(bio, encoding="utf-8")
             (base / f"{safe_filename(person)}_sources.json").write_text(json.dumps(verified_cards, ensure_ascii=False, indent=2), encoding="utf-8")
             st.success(f"Saved bio and sources → {base}")
 
-st.caption("No Selenium/browser required. Works on Streamlit Cloud, Spaces, Azure Web Apps, etc.")
+# Footer tip
+st.caption("Tip: If Google blocks automated requests in your region, try Bing + Headless mode first.")
