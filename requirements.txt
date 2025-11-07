@@ -1,0 +1,8 @@
+streamlit>=1.0
+pandas>=1.4
+beautifulsoup4
+selenium
+nltk
+
+# Optional: Google Gemini (commented out by default — enable only if you have API access)
+# google-generativeai
